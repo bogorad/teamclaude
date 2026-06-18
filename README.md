@@ -23,6 +23,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
+- **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
 
@@ -163,6 +164,7 @@ teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
@@ -226,10 +228,25 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
+| `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default) |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
+
+### Quota probe (optional, off by default)
+
+By default TeamClaude is **passive** — it learns each account's quota only from the responses that flow through it, so an account that hasn't been used yet shows unknown quota until it's first rotated to.
+
+If you'd rather keep idle accounts' quota fresh, enable the background probe:
+
+```bash
+teamclaude probe 300    # refresh every 300s
+teamclaude probe off    # back to passive (default)
+teamclaude probe        # show current setting
+```
+
+It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** bucket as an extra bar in the TUI / `status` (when your plan exposes it).
 
 ## How It Works
 

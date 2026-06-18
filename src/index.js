@@ -9,6 +9,7 @@ import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import * as alias from './alias.js';
+import { Prober } from './prober.js';
 import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
@@ -63,6 +64,10 @@ switch (command) {
     break;
   case 'alias':
     aliasCommand();
+    process.exit(0);
+    break;
+  case 'probe':
+    await probeCommand();
     process.exit(0);
     break;
   case 'help':
@@ -157,13 +162,25 @@ async function serverCommand() {
   const headless = args.includes('--headless') || args.includes('--no-tui');
   const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
 
+  // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
+  let prober = null;
+
   // Re-sync accounts from disk without a restart. The TUI's 'R' key, the
   // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
-  // funnel through here. Returns the number of newly added accounts.
+  // funnel through here. Returns the number of newly added accounts. Also picks
+  // up a changed probe interval so `teamclaude probe` applies live.
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
-    return syncAccountsFromDisk(diskConfig, config, accountManager);
+    const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    if (prober) {
+      const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
+      if (ms !== prober.intervalMs) {
+        config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
+        prober.reschedule(ms);
+      }
+    }
+    return added;
   };
 
   let tui = null;
@@ -190,6 +207,7 @@ async function serverCommand() {
       }),
       syncAccounts: reloadAccounts,
       onQuit: async () => {
+        prober?.stop();
         if (quotaSaveInterval) clearInterval(quotaSaveInterval);
         await persistQuotaState();
         server.close(() => process.exit(0));
@@ -246,9 +264,14 @@ async function serverCommand() {
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
 
+  // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
+  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober.start();
+
   if (!tui) {
     const shutdown = async () => {
       console.log('\n[TeamClaude] Shutting down...');
+      prober?.stop();
       clearInterval(quotaSaveInterval);
       await persistQuotaState();
       server.close(() => process.exit(0));
@@ -449,10 +472,12 @@ async function statusCommand() {
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.status}${acct.disabled ? ' (disabled)' : ''}`);
 
-      if (q.unified5h != null || q.unified7d != null) {
+      if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        console.log(`    Session:  ${ses} used    Weekly: ${wk} used`);
+        let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
+        if (q.unified7dSonnet != null) line += `    Sonnet7d: ${(q.unified7dSonnet * 100).toFixed(1)}% used`;
+        console.log(line);
       } else {
         const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
         const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
@@ -654,6 +679,42 @@ function aliasCommand() {
   }
 }
 
+// ── probe ───────────────────────────────────────────────────
+
+async function probeCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+
+  if (arg === undefined) {
+    const cur = config.quotaProbeSeconds || 0;
+    console.log(cur > 0 ? `Quota probe: every ${cur}s` : 'Quota probe: off (passive only)');
+    console.log('Set with: teamclaude probe <off|seconds>   e.g. teamclaude probe 300');
+    return;
+  }
+
+  let seconds;
+  if (arg === 'off' || arg === '0') {
+    seconds = 0;
+  } else {
+    seconds = parseInt(arg, 10);
+    if (Number.isNaN(seconds) || seconds < 0) {
+      console.error('Usage: teamclaude probe <off|seconds>');
+      process.exit(1);
+    }
+    if (seconds > 0 && seconds < 30) {
+      console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
+      process.exit(1);
+    }
+  }
+
+  config.quotaProbeSeconds = seconds;
+  await saveConfig(config);
+  console.log(seconds > 0
+    ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
+    : 'Quota probe disabled (passive only).');
+  await notifyRunningServer(config);
+}
+
 // ── remove ──────────────────────────────────────────────────
 
 /**
@@ -786,6 +847,8 @@ Commands:
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  probe [off|secs]    Opt-in background quota refresh for idle accounts
+                      (off by default; reads usage endpoint, spends no quota)
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 

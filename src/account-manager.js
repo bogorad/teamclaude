@@ -5,7 +5,8 @@ import { sameIdentity } from './identity.js';
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
 const PERSISTED_QUOTA_FIELDS = [
-  'unified5h', 'unified7d', 'unified5hReset', 'unified7dReset', 'unifiedStatus',
+  'unified5h', 'unified7d', 'unified7dSonnet',
+  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unifiedStatus',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
 ];
 
@@ -17,11 +18,13 @@ function emptyQuota() {
     requestsLimit: null,
     requestsRemaining: null,
     // Unified rate limits (Claude Max accounts)
-    unified5h: null,       // utilization 0-1
-    unified7d: null,       // utilization 0-1
-    unified5hReset: null,  // ms timestamp
-    unified7dReset: null,  // ms timestamp
-    unifiedStatus: null,   // allowed | allowed_warning | rejected
+    unified5h: null,            // utilization 0-1
+    unified7d: null,            // utilization 0-1
+    unified7dSonnet: null,      // utilization 0-1 (Sonnet-specific weekly bucket)
+    unified5hReset: null,       // ms timestamp
+    unified7dReset: null,       // ms timestamp
+    unified7dSonnetReset: null, // ms timestamp
+    unifiedStatus: null,        // allowed | allowed_warning | rejected
     resetsAt: null,
   };
 }
@@ -132,6 +135,11 @@ export class AccountManager {
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
+      changed = true;
+    }
+    if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
+      q.unified7dSonnet = null;
+      q.unified7dSonnetReset = null;
       changed = true;
     }
 
@@ -377,6 +385,37 @@ export class AccountManager {
       account.status = 'active';
       account.rateLimitedUntil = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+    }
+  }
+
+  /**
+   * Apply quota learned from the OAuth usage endpoint (the background probe).
+   * Updates utilization/reset for the 5h, 7d, and Sonnet-7d buckets WITHOUT
+   * touching usage counters — a probe is not real client traffic.
+   */
+  applyUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage) return;
+    const q = account.quota;
+
+    if (usage.fiveHour) {
+      if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
+      if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
+    }
+    if (usage.sevenDay) {
+      if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
+      if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
+    }
+    if (usage.sevenDaySonnet) {
+      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+      if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    }
+
+    // If we just learned this account's weekly window while probing, re-evaluate
+    // selection (same path as learning it from a live response).
+    if (account.probing && q.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
     }
   }
 
