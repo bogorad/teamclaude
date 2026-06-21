@@ -121,7 +121,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, log: console.error }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error }));
 
   return server;
 }
