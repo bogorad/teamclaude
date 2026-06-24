@@ -58,6 +58,12 @@ export class AccountManager {
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    // When every account reads as over-quota we would otherwise refuse locally
+    // forever (a stale cached utilization is never re-validated because no
+    // request is ever sent). Instead, allow one real upstream probe at most this
+    // often to refresh the cached quota. See _selectProbe.
+    this.probeIntervalMs = 60_000;
+    this._nextProbeAt = 0;
   }
 
   /**
@@ -86,7 +92,76 @@ export class AccountManager {
         this._isAvailable(a) && (a.priority || 0) < (current.priority || 0));
       return betterExists ? this._selectNext() : current;
     }
-    return this._selectNext();
+    const next = this._selectNext();
+    if (next) return next;
+    // No account is under the switch threshold. Before refusing locally, allow a
+    // throttled probe so a stale/poisoned cached quota can't pin us in a
+    // permanent "all exhausted" state — the probe's real response refreshes the
+    // quota (or upstream's own 429 converts soft exhaustion into a hard
+    // rate-limit hold). null here means the caller emits the synthetic 429.
+    return this._selectProbe();
+  }
+
+  _isProbeable(account) {
+    if (!account) return false;
+    // Never probe an account the operator has taken out of rotation, one whose
+    // token is broken, or one upstream has explicitly rate-limited — those are
+    // hard states, not stale soft-quota guesses.
+    if (account.disabled) return false;
+    if (account.status === 'error' || account.status === 'exhausted') return false;
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && Date.now() < account.rateLimitedUntil) return false;
+    return true;
+  }
+
+  /** Highest utilization across all known quota dimensions (0-1), used to pick
+   * the least-exhausted probe target. Mirrors the ratios in _isNearQuota. */
+  _maxUtilization(account) {
+    const q = account.quota;
+    let max = 0;
+    if (q.unified5h != null) max = Math.max(max, q.unified5h);
+    if (q.unified7d != null) max = Math.max(max, q.unified7d);
+    if (q.tokensLimit != null && q.tokensRemaining != null) {
+      max = Math.max(max, 1 - q.tokensRemaining / q.tokensLimit);
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null) {
+      max = Math.max(max, 1 - q.requestsRemaining / q.requestsLimit);
+    }
+    return max;
+  }
+
+  /**
+   * Pick an account to send a single revalidation probe upstream when every
+   * account reads as over the switch threshold. Throttled to one probe per
+   * probeIntervalMs so a genuinely-exhausted fleet isn't hammered — between
+   * probes this returns null and the caller falls back to the synthetic 429.
+   * The chosen account is the least-utilized probeable one (most likely to have
+   * stale headroom), so the refreshed quota corrects the cache fastest.
+   */
+  _selectProbe() {
+    const now = Date.now();
+    if (now < this._nextProbeAt) return null;
+
+    let best = null;
+    let bestPriority = Infinity;
+    let bestUsage = Infinity;
+    for (const account of this.accounts) {
+      if (!this._isProbeable(account)) continue;
+      const priority = account.priority || 0;
+      const usage = this._maxUtilization(account);
+      if (priority < bestPriority ||
+          (priority === bestPriority && usage < bestUsage)) {
+        bestPriority = priority;
+        bestUsage = usage;
+        best = account;
+      }
+    }
+    if (!best) return null;
+
+    this._nextProbeAt = now + this.probeIntervalMs;
+    this.currentIndex = best.index;
+    console.log(`[TeamClaude] All accounts over threshold — probing "${best.name}" to refresh quota`);
+    return best;
   }
 
   _isAvailable(account) {
