@@ -569,7 +569,7 @@ async function accountsCommand() {
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
       configDirty = true;
-    } catch (err) {
+    } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
