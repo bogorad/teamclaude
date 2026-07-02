@@ -42,8 +42,13 @@ function writeBackpressured(dst, buf, ctl) {
  * @param opts.log
  */
 export function h2Relay(claude, upstream, opts = {}) {
+  // rewriteRequest/makeBodyPatcher/onResponseHeaders all receive the stream id so
+  // the caller can bind a DIFFERENT account per request on this one tunnel (the
+  // upstream socket is account-agnostic; the account is only the injected auth +
+  // body account_uuid). onStreamClose lets the caller drop its per-stream state.
   const rewriteRequest = opts.rewriteRequest || ((f) => f);
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
+  const onStreamClose = opts.onStreamClose || (() => {});
   const makeBodyPatcher = opts.makeBodyPatcher || null; // () => { push(buf)->buf } per stream
   const bodyPatchers = makeBodyPatcher ? new Map() : null; // streamId -> patcher
   const tap = opts.tap || null; // optional request-logging tap (per streamId)
@@ -53,7 +58,8 @@ export function h2Relay(claude, upstream, opts = {}) {
   // mid-flight connection teardown can close their tap records instead of
   // leaking them (e.g. a stuck "in-flight" entry in the TUI activity feed).
   const openStreams = new Set();
-  const closeStream = (id) => { if (bodyPatchers) bodyPatchers.delete(id); tap?.end(id); openStreams.delete(id); };
+  const NO_PATCH = { push: (b) => b }; // per-stream sentinel when the chosen account has no uuid to patch
+  const closeStream = (id) => { if (bodyPatchers) bodyPatchers.delete(id); tap?.end(id); openStreams.delete(id); onStreamClose(id); };
 
   const reqDec = new HpackDecoder();         // decodes claude's request blocks
   const reqEnc = new HpackEncoder();         // re-encodes to upstream
@@ -72,25 +78,49 @@ export function h2Relay(claude, upstream, opts = {}) {
   let asm = null; // { streamId, frags:[], priority, endStream } while assembling a block
   let reqCtl;
 
+  // The pump is async ONLY so it can await a token refresh before forwarding a
+  // request whose account's token had expired (rewriteRequest returns a promise
+  // in that rare case). In the common case handleReqFrame returns nothing, the
+  // loop never awaits, and the whole pump runs synchronously start-to-finish — so
+  // no frames can interleave. When it does suspend, `reqPumping` makes a
+  // concurrent data event just append to rbuf; the running pump drains it on the
+  // next iteration. The only suspension point is `await r`, and the tail after it
+  // (break → finally) runs without yielding, so there is no lost-wakeup race.
+  let reqPumping = false;
   const onReqData = (chunk) => {
     rbuf = Buffer.concat([rbuf, chunk]);
-    if (!prefaceSeen) {
-      if (rbuf.length < PREFACE.length) return;
-      writeBackpressured(upstream, rbuf.subarray(0, PREFACE.length), reqCtl); // forward preface verbatim
-      rbuf = rbuf.subarray(PREFACE.length);
-      prefaceSeen = true;
-    }
-    const { frames, rest } = readFrames(rbuf);
-    rbuf = rest;
-    for (const fr of frames) handleReqFrame(fr);
+    if (reqPumping) return; // a suspended pump will pick up the appended bytes
+    pumpReq();
   };
+
+  async function pumpReq() {
+    reqPumping = true;
+    try {
+      if (!prefaceSeen) {
+        if (rbuf.length < PREFACE.length) return;
+        writeBackpressured(upstream, rbuf.subarray(0, PREFACE.length), reqCtl); // forward preface verbatim
+        rbuf = rbuf.subarray(PREFACE.length);
+        prefaceSeen = true;
+      }
+      for (;;) {
+        const { frames, rest } = readFrames(rbuf);
+        rbuf = rest;
+        if (!frames.length) break;
+        for (const fr of frames) {
+          const r = handleReqFrame(fr);
+          if (r && typeof r.then === 'function') await r; // HEADERS awaiting a token refresh
+        }
+      }
+    } catch { destroyBoth(); }
+    finally { reqPumping = false; }
+  }
 
   function handleReqFrame(fr) {
     // Mid-block: only CONTINUATION on the same stream may follow (RFC 7540 §6.10).
     if (asm) {
       if (fr.type === FRAME.CONTINUATION && fr.streamId === asm.streamId) {
         asm.frags.push(Buffer.from(fr.payload));
-        if (fr.flags & FLAG.END_HEADERS) finishReqBlock();
+        if (fr.flags & FLAG.END_HEADERS) return finishReqBlock(); // may be a promise (token refresh)
         return;
       }
       // Shouldn't happen; bail safely.
@@ -99,7 +129,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     if (fr.type === FRAME.HEADERS) {
       const { block, priority } = stripHeadersPayload(fr.payload, fr.flags);
       asm = { streamId: fr.streamId, frags: [block], priority, endStream: !!(fr.flags & FLAG.END_STREAM) };
-      if (fr.flags & FLAG.END_HEADERS) finishReqBlock();
+      if (fr.flags & FLAG.END_HEADERS) return finishReqBlock(); // may be a promise (token refresh)
       return;
     }
     if (fr.type === FRAME.DATA && (bodyPatchers || tap)) {
@@ -109,7 +139,7 @@ export function h2Relay(claude, upstream, opts = {}) {
       let payload = Buffer.from(fr.payload);
       if (bodyPatchers) {
         let p = bodyPatchers.get(fr.streamId);
-        if (!p) { p = makeBodyPatcher(); bodyPatchers.set(fr.streamId, p); }
+        if (p === undefined) { p = makeBodyPatcher(fr.streamId) || NO_PATCH; bodyPatchers.set(fr.streamId, p); }
         payload = p.push(payload);
       }
       if (tap) tap.reqData(fr.streamId, payload);
@@ -128,11 +158,18 @@ export function h2Relay(claude, upstream, opts = {}) {
     const { streamId, frags, priority, endStream } = asm;
     asm = null;
     const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync
-    const rewritten = rewriteRequest(fields);
-    if (tap) tap.req(streamId, rewritten);
-    openStreams.add(streamId);
-    const newBlock = reqEnc.encode(rewritten);
-    writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
+    // Encode/forward once we have the (possibly async-rewritten) header list. The
+    // pump awaits this before the next frame, so decode & encode stay in wire
+    // order and the HPACK tables never desync even when a refresh suspends us.
+    const proceed = (rewritten) => {
+      if (tap) tap.req(streamId, rewritten);
+      openStreams.add(streamId);
+      const newBlock = reqEnc.encode(rewritten);
+      writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
+    };
+    const rewritten = rewriteRequest(fields, streamId);
+    if (rewritten && typeof rewritten.then === 'function') return rewritten.then(proceed);
+    proceed(rewritten);
   }
 
   reqCtl = link(claude, upstream, onReqData, destroyBoth);
@@ -176,7 +213,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     rasm = null;
     try {
       const fields = respDec.decode(Buffer.concat(frags));
-      onResponseHeaders(fields);
+      onResponseHeaders(fields, streamId);
       if (tap) tap.res(streamId, fields);
     } catch (err) {
       log(`[TeamClaude] h2 response header decode failed: ${err.message}`);
@@ -266,9 +303,13 @@ const statusOf = (startLine) => parseInt(startLine.split(' ')[1], 10) || 0;
  * @param opts.onResponseHeaders (fields[]) => void    // observe each response's headers
  */
 export function h1Relay(claude, upstream, opts = {}) {
+  // rewriteHead/makeBodyPatcher/onResponseHeaders receive the per-request id so
+  // the caller can bind a different account to each request on this keep-alive
+  // connection; onRequestClose lets it drop that per-request state.
   const rewriteHead = opts.rewriteHead || ((h) => h);
   const makeBodyPatcher = opts.makeBodyPatcher || null;
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
+  const onRequestClose = opts.onStreamClose || (() => {});
   const tap = opts.tap || null;
   const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
   claude.on('error', destroyBoth);
@@ -285,35 +326,49 @@ export function h1Relay(claude, upstream, opts = {}) {
   let reqPhase = 'head';
   let reqTrack = null, reqPatcher = null, reqId = null;
 
-  const pumpReq = () => {
-    while (reqBuf.length) {
-      if (reqPhase === 'head') {
-        const idx = reqBuf.indexOf('\r\n\r\n');
-        if (idx < 0) { if (reqBuf.length > MAX_HEAD) destroyBoth(); return; }
-        const head = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'));
-        reqBuf = reqBuf.subarray(idx + 4);
-        const info = parseH1Head(head);
-        reqId = ++nextId;
-        pending.push({ id: reqId, method: methodOf(info.startLine) });
-        if (tap) tap.reqHead(reqId, head);
-        upstream.write(Buffer.from(head, 'latin1'));
-        const kind = info.chunked ? 'chunked' : (info.contentLength > 0 ? 'length' : 'none');
-        reqPatcher = makeBodyPatcher ? makeBodyPatcher() : null;
-        reqTrack = makeBodyTracker(kind, info.contentLength || 0);
-        reqPhase = 'body';
-      } else {
-        const { consumed, done } = reqTrack(reqBuf);
-        if (consumed > 0) {
-          let slice = Buffer.from(reqBuf.subarray(0, consumed));
-          reqBuf = reqBuf.subarray(consumed);
-          if (reqPatcher) slice = reqPatcher.push(slice); // same-length account_uuid patch
-          if (tap) tap.reqData(reqId, slice);
-          upstream.write(slice);
+  // Async ONLY so a request head whose account token expired can await a refresh
+  // before it is forwarded (rewriteHead returns a promise in that rare case).
+  // Requests are strictly serial in h1, so `reqPumping` guards re-entrancy: while
+  // suspended, a data event just appends to reqBuf and the running pump drains it.
+  // The common case never awaits and runs fully synchronously.
+  let reqPumping = false;
+  const pumpReq = async () => {
+    if (reqPumping) return;
+    reqPumping = true;
+    try {
+      while (reqBuf.length) {
+        if (reqPhase === 'head') {
+          const idx = reqBuf.indexOf('\r\n\r\n');
+          if (idx < 0) { if (reqBuf.length > MAX_HEAD) destroyBoth(); break; }
+          // Assign the id BEFORE rewriting so the caller can bind this request's
+          // account (used again to attribute the response and patch the body).
+          reqId = ++nextId;
+          const rew = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'), reqId);
+          const head = (rew && typeof rew.then === 'function') ? await rew : rew;
+          reqBuf = reqBuf.subarray(idx + 4);
+          const info = parseH1Head(head);
+          pending.push({ id: reqId, method: methodOf(info.startLine) });
+          if (tap) tap.reqHead(reqId, head);
+          upstream.write(Buffer.from(head, 'latin1'));
+          const kind = info.chunked ? 'chunked' : (info.contentLength > 0 ? 'length' : 'none');
+          reqPatcher = makeBodyPatcher ? makeBodyPatcher(reqId) : null;
+          reqTrack = makeBodyTracker(kind, info.contentLength || 0);
+          reqPhase = 'body';
+        } else {
+          const { consumed, done } = reqTrack(reqBuf);
+          if (consumed > 0) {
+            let slice = Buffer.from(reqBuf.subarray(0, consumed));
+            reqBuf = reqBuf.subarray(consumed);
+            if (reqPatcher) slice = reqPatcher.push(slice); // same-length account_uuid patch
+            if (tap) tap.reqData(reqId, slice);
+            upstream.write(slice);
+          }
+          if (done) { reqPhase = 'head'; reqTrack = null; reqPatcher = null; }
+          else if (consumed === 0) break; // need more body bytes
         }
-        if (done) { reqPhase = 'head'; reqTrack = null; reqPatcher = null; }
-        else if (consumed === 0) return; // need more body bytes
       }
-    }
+    } catch { destroyBoth(); }
+    finally { reqPumping = false; }
   };
   claude.on('data', (c) => { reqBuf = Buffer.concat([reqBuf, c]); pumpReq(); });
   claude.on('end', () => upstream.end());
@@ -334,9 +389,11 @@ export function h1Relay(claude, upstream, opts = {}) {
         const info = parseH1Head(head);
         const status = statusOf(info.startLine);
         if (status >= 100 && status < 200) continue; // interim (e.g. 100-continue): no body, no request consumed
-        onResponseHeaders(headFields(head));
+        // Match the response to its request FIRST so quota is attributed to the
+        // account THAT request used (each request may be a different account).
         const req = pending.shift();
         resId = req ? req.id : ++nextId;
+        onResponseHeaders(headFields(head), resId);
         if (tap) tap.resHead(resId, head);
         const bodyless = req?.method === 'HEAD' || status === 204 || status === 304;
         const kind = bodyless ? 'none'
@@ -348,7 +405,7 @@ export function h1Relay(claude, upstream, opts = {}) {
       } else {
         const { consumed, done } = resTrack(resBuf);
         if (consumed > 0) { if (tap) tap.resData(resId, Buffer.from(resBuf.subarray(0, consumed))); resBuf = resBuf.subarray(consumed); }
-        if (done) { if (tap) tap.end(resId); resId = null; resPhase = 'head'; resTrack = null; }
+        if (done) { if (tap) tap.end(resId); onRequestClose(resId); resId = null; resPhase = 'head'; resTrack = null; }
         else if (consumed === 0) return;
       }
     }
