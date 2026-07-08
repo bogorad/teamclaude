@@ -44,7 +44,7 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -76,10 +76,34 @@ export class AccountManager {
       },
       rateLimitedUntil: null,
       throttledAt: null,
+      // Storm control (see admit/release): in-flight upstream requests and the
+      // time this account last became the current one (starts a ramp window).
+      inFlight: 0,
+      rampStartedAt: null,
+      // Rate-limit pause (see pauseAccount): a short window during which new
+      // requests wait in admit() rather than flooding — set from a 429's
+      // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
+      // make the account unavailable, so selection never rotates away from it.
+      pausedUntil: null,
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
+    // Storm control: when rotation switches to a fresh account, a burst of
+    // in-flight requests (e.g. dozens of agents failing over together) would all
+    // hit it at once and instantly throttle it — cascading down the fleet
+    // (issue #84). admit() caps concurrent requests to a just-switched account
+    // and ramps the cap up over a short window, so the first few reveal whether
+    // it's also near-exhausted before the whole herd commits.
+    this.ramp = {
+      enabled: true,
+      startConc: 1,       // concurrent requests allowed at the instant of a switch
+      stepConc: 1,        // cap increase per stepMs
+      stepMs: 250,        // → +stepConc every 250ms (default ramps ~4 req/s)
+      windowMs: 30_000,   // after this, pacing stops entirely (cap = Infinity)
+      pollMs: 50,         // how often a waiting request re-checks the cap
+      ...ramp,
+    };
     // When every account reads as over-quota we would otherwise refuse locally
     // forever (a stale cached utilization is never re-validated because no
     // request is ever sent). Instead, allow one real upstream probe at most this
@@ -91,6 +115,78 @@ export class AccountManager {
     // retry-after, short enough that a stale hold cannot pin the fleet.
     this.throttleProbeFloorMs = throttleProbeFloorMs
       ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+  }
+
+  /** Start (or restart) the ramp window for an account that just became current,
+   * so a failover burst is paced onto it rather than all landing at once. */
+  _beginRamp(account) {
+    if (account && this.ramp.enabled) account.rampStartedAt = Date.now();
+  }
+
+  /** Max concurrent upstream requests allowed to `account` right now. Infinity
+   * once the ramp window has elapsed (or ramping is off / never started). */
+  _rampCap(account, now = Date.now()) {
+    if (!this.ramp.enabled || account.rampStartedAt == null) return Infinity;
+    // Clamp to 0: pauseAccount arms rampStartedAt in the FUTURE (pause-end), so a
+    // call during the pause would otherwise yield a negative elapsed → negative
+    // cap. admit()'s pause branch already guards this, but keep _rampCap sound on
+    // its own — a future start simply means "cap is at its floor (startConc)".
+    const elapsed = Math.max(0, now - account.rampStartedAt);
+    if (elapsed >= this.ramp.windowMs) { account.rampStartedAt = null; return Infinity; }
+    return this.ramp.startConc + Math.floor(elapsed / this.ramp.stepMs) * this.ramp.stepConc;
+  }
+
+  /**
+   * Reserve a concurrency slot on `account` before sending upstream. Waits while
+   * the account is in a rate-limit pause (a 429's retry-after window) and while
+   * it is over its current ramp cap. Fail-open: returns true once a slot is taken
+   * (always eventually — the pause ends and the ramp cap grows), or false if
+   * `isAborted()` reports the client went away while waiting. Pair every `true`
+   * with a `release(index)`.
+   */
+  async admit(index, isAborted) {
+    const account = this.accounts[index];
+    if (!account) return true;
+    while (true) {
+      if (isAborted?.()) return false;
+      const now = Date.now();
+      // Rate-limit pause: hold new requests off this account until the window
+      // passes instead of flooding it (which would deepen the 429). Not a
+      // rotation trigger — the account stays selectable the whole time.
+      if (account.pausedUntil && now < account.pausedUntil) {
+        await new Promise(r => setTimeout(r, Math.min(account.pausedUntil - now, this.ramp.pollMs * 4)));
+        continue;
+      }
+      const cap = this.ramp.enabled ? this._rampCap(account, now) : Infinity;
+      if (account.inFlight < cap) { account.inFlight++; return true; }
+      await new Promise(r => setTimeout(r, this.ramp.pollMs));
+    }
+  }
+
+  /** Release a slot taken by admit(). Safe to call once per successful admit. */
+  release(index) {
+    const account = this.accounts[index];
+    if (account && account.inFlight > 0) account.inFlight--;
+  }
+
+  /**
+   * Pause an account after a rate-limit (non-quota) 429 so concurrent requests
+   * wait in admit() instead of piling on. Unlike markRateLimited this does NOT
+   * set `throttled`/rateLimitedUntil, so _isAvailable still returns true and
+   * selection never rotates away — rotation is reserved for quota exhaustion.
+   * When the pause lifts, the held requests are released through a fresh ramp
+   * window (storm control) so they trickle out rather than flood. Extends an
+   * existing pause rather than shortening it.
+   */
+  pauseAccount(index, seconds) {
+    const account = this.accounts[index];
+    if (!account) return;
+    const until = Date.now() + Math.max(0, seconds) * 1000;
+    account.pausedUntil = Math.max(account.pausedUntil || 0, until);
+    // Arm the ramp to begin when the pause ends: while paused, admit() holds on
+    // the pause branch; once it lifts, _rampCap counts from here and releases the
+    // backlog gradually (startConc, then +stepConc per step).
+    if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
   }
 
   /**
@@ -259,6 +355,7 @@ export class AccountManager {
 
     this._nextProbeAt = now + this.probeIntervalMs;
     this.currentIndex = best.index;
+    this._beginRamp(best);
     if (best.status === 'throttled') {
       console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
     } else {
@@ -490,6 +587,7 @@ export class AccountManager {
 
     if (best) {
       this.currentIndex = best.index;
+      this._beginRamp(best);
       console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
     }
   }
@@ -575,6 +673,7 @@ export class AccountManager {
     const best = this._pickBestAvailable();
     if (!best) return this.accounts[this.currentIndex] || null;
     this.currentIndex = best.index;
+    this._beginRamp(best);
     best.probing = best.quota.unified7dReset == null;
     const wk = best.quota.unified7d != null
       ? `${(best.quota.unified7d * 100).toFixed(1)}% weekly used`
@@ -592,6 +691,7 @@ export class AccountManager {
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
       if (switched) {
+        this._beginRamp(best);
         console.log(`[TeamClaude] Switched to account "${best.name}"`);
       }
       return best;
@@ -625,6 +725,7 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
+      this._beginRamp(soonestAccount);
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
@@ -954,6 +1055,9 @@ export class AccountManager {
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
+          : null,
+        pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
+          ? new Date(a.pausedUntil).toISOString()
           : null,
       })),
     };
