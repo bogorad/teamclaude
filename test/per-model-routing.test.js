@@ -166,6 +166,54 @@ test('routes with no account list fall back to the legacy per-account models cla
   assert.equal(am._isAvailable(am.accounts[1], FABLE), true, 'b owns Fable');
 });
 
+// ── read-only route preview (drives the single F7/S7 marker) ──
+
+test('previewRouteIndex names the ONE account a model routes to, matching getActiveAccount', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
+  const future = Date.now() + 3600_000;
+  for (const acc of am.accounts) {
+    acc.quota.unified5h = 0.1; acc.quota.unified5hReset = future;
+    acc.quota.unified7d = 0.1; acc.quota.unified7dReset = future;
+    acc.quota.unified7dFable = 0.2; acc.quota.unified7dFableReset = future; // all meter Fable
+  }
+  // Every account is Fable-eligible, yet the marker must resolve to exactly one.
+  const target = am.previewRouteIndex(FABLE);
+  assert.equal(typeof target, 'number');
+  assert.equal(am.accounts[target].name, am.getActiveAccount(null, FABLE).name,
+    'preview matches the account a real request would be served by');
+});
+
+test('previewRouteIndex is read-only — it never moves currentIndex', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const future = Date.now() + 3600_000;
+  // a is Fable-spent, so a Fable request routes to b — but previewing it must not
+  // shift the global current account away from a (that thrash is the bug we fix).
+  am.accounts[0].quota.unified5h = 0.1; am.accounts[0].quota.unified7d = 0.1;
+  am.accounts[0].quota.unified7dFable = 1.0; am.accounts[0].quota.unified7dFableReset = future;
+  am.accounts[1].quota.unified5h = 0.1; am.accounts[1].quota.unified7d = 0.1;
+  am.accounts[1].quota.unified7dFable = 0.2; am.accounts[1].quota.unified7dFableReset = future;
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.accounts[am.previewRouteIndex(FABLE)].name, 'b'); // Fable falls to b
+  assert.equal(am.currentIndex, 0, 'currentIndex unchanged by the preview');
+});
+
+test('previewRouteIndex honors a pin, and falls back when the pin is ineligible', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
+  const future = Date.now() + 3600_000;
+  for (const acc of am.accounts) { acc.quota.unified7dFable = 0.2; acc.quota.unified7dFableReset = future; }
+  am.setRoutePin('fable', 2);                                   // pin c
+  assert.equal(am.accounts[am.previewRouteIndex(FABLE)].name, 'c');
+  am.accounts[2].quota.unified7dFable = 1.0;                    // c's Fable now spent
+  assert.notEqual(am.accounts[am.previewRouteIndex(FABLE)].name, 'c', 'pin ineligible → fallback');
+});
+
+test('previewRouteIndex returns null when no account can serve the model', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  am.accounts[0].quota.unified5h = 0.999;                       // shared 5h spent → nothing routes
+  am.accounts[0].quota.unified5hReset = Date.now() + 3600_000;
+  assert.equal(am.previewRouteIndex(FABLE), null);
+});
+
 test('setRoutes normalizes shapes and is re-appliable on reload', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   assert.deepEqual(am.routes, []);

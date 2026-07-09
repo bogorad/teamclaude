@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { TUI } from '../src/tui.js';
+import { AccountManager } from '../src/account-manager.js';
+
+const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 
 // Minimal AccountManager stand-in for the routes editor: it only needs the
 // surface the editor touches (accounts, setRoutes). render() is stubbed out so
@@ -146,6 +149,32 @@ test('TUI switch mode: Tab is inert for remove/toggle actions', () => {
   tui._key('r');                       // remove action
   tui._key('tab');
   assert.equal(tui.selRoute, null);    // unchanged — Tab only cycles in switch mode
+});
+
+test('TUI: the F7 (Fable) marker sits on exactly one account — the routing target', () => {
+  const future = Date.now() + 7 * 24 * 3600_000;
+  const oauth = n => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: future });
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
+  for (const acc of am.accounts) {
+    acc.quota.unified5h = 0.1; acc.quota.unified5hReset = future;
+    acc.quota.unified7d = 0.1; acc.quota.unified7dReset = future;
+    acc.quota.unified7dFable = 0.2; acc.quota.unified7dFableReset = future; // all meter Fable → F7 bar shows
+  }
+  // a's Fable weekly is spent → Fable routes elsewhere, but a stays the default current.
+  am.accounts[0].quota.unified7dFable = 1.0;
+
+  const tui = Object.create(TUI.prototype);
+  tui.am = am; tui.mode = 'normal'; tui.selIdx = -1;
+  const routes = am.getRoutes();
+  const familyTarget = { fable: am.previewRouteIndex('claude-fable-5'), sonnet: null };
+
+  const rows = am.accounts.map((_, i) =>
+    stripAnsi(tui._renderAcct(i, 8, true, routes, [], familyTarget)));
+  const marked = rows.filter(r => /►\s*F7/.test(r));
+  assert.equal(marked.length, 1, 'exactly one F7 marker across all accounts');
+  // ...and it is NOT the Fable-spent account a (which instead shows the ⊘ tag).
+  assert.ok(!/►\s*F7/.test(rows[0]), 'the Fable-spent account carries no F7 marker');
+  assert.match(rows[0], /⊘ Fable/, 'the Fable-spent account is tagged blocked');
 });
 
 test('TUI routes editor: delete removes the selected route', async () => {

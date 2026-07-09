@@ -265,6 +265,30 @@ export class AccountManager {
     return account;
   }
 
+  /**
+   * Read-only: the index of the account a request for `model` would be served by
+   * right now — the same decision getActiveAccount makes (manual pin → the global
+   * current account if it can serve the model → best-available), but WITHOUT
+   * mutating currentIndex and without the exhausted-fleet probe fallback. Returns
+   * null when nothing can serve `model` at the moment. The TUI uses this to mark
+   * the single account each secondary bucket (Fable/Sonnet) currently routes to —
+   * the F7/S7 analogue of the ► that marks the default route's current account.
+   */
+  previewRouteIndex(model) {
+    const pinned = this._pinnedAccountForModel(model);
+    if (pinned && this._isAvailable(pinned, model)) return pinned.index;
+    const current = this.accounts[this.currentIndex];
+    if (current && this._isAvailable(current, model)) {
+      // Mirror getActiveAccount's priority preemption: a strictly higher-priority
+      // available account wins over a healthy current one; same tier stays put.
+      const better = this.accounts.some(a =>
+        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+      if (!better) return current.index;
+    }
+    const best = this._pickBestAvailable(null, model);
+    return best ? best.index : null;
+  }
+
   _isProbeable(account) {
     if (!account) return false;
     // Never probe an account the operator has taken out of rotation or one

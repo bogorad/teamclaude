@@ -759,8 +759,17 @@ export class TUI {
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
+      // The single account each secondary bucket currently routes to (null = none
+      // can serve it right now). Marked next to that account's F7/S7 bar — the
+      // secondary-quota analogue of ► marking the default route's current account.
+      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
+      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
+      const familyTarget = {
+        fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
+        sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
+      };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget));
       }
     }
 
@@ -810,7 +819,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null)) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -830,12 +839,17 @@ export class TUI {
     });
     const startSlot = genRoutes.length ? `${startCells.join('')} ` : '';
 
-    // Family-route markers for this account's F7/S7 bars.
+    // Family (Fable/Sonnet) marker for this account's F7/S7 bar: a single ► on the
+    // one account that bucket currently routes to — the secondary-quota analogue of
+    // the default route's ►, not one marker per eligible account. Every account
+    // meters the bucket, so "membership" is meaningless here; only the live routing
+    // target matters. Bold when that target is the route's manual pin; the route's
+    // configured color is honored, else cyan.
     const familyMark = (fam) => {
-      const r = routes.find(x => routeFamily(x) === fam && memberOf(x));
-      if (!r) return ' ';
-      const m = memberOf(r);
-      return routeGlyph(routeColorFn(r.color), m.eligible, r.pinned === a.name);
+      if (familyTarget[fam] !== idx) return ' ';
+      const r = routes.find(x => routeFamily(x) === fam);
+      const pinned = r ? r.pinned === a.name : false;
+      return routeGlyph(routeColorFn(r?.color), true, pinned);
     };
 
     // Name (bold if selected)
