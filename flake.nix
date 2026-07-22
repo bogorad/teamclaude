@@ -34,6 +34,21 @@
         }
       );
 
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          # `nix flake check` builds the package on every system.
+          package = self.packages.${system}.teamclaude;
+        }
+        # The NixOS VM test only runs on Linux (nixosTest requires a Linux host).
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          nixos-module = import ./nix/tests/module.nix { inherit pkgs self system; };
+        }
+      );
+
       apps = forAllSystems (system: {
         teamclaude = {
           type = "app";

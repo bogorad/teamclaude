@@ -18,6 +18,8 @@ It also exports:
 - `nixosModules.default`
 - `homeManagerModules.teamclaude`
 - `homeManagerModules.default`
+- `checks.${system}.package` (the package build)
+- `checks.${system}.nixos-module` (NixOS VM test; Linux only)
 
 Supported package systems are:
 
@@ -230,13 +232,32 @@ curl --proxy http://<proxy.apiKey>@teamclaude-host:3456 \
   https://www.example.org/
 ```
 
+## Tests
+
+The flake exposes its tests as `checks`, so `nix flake check` runs them all:
+
+```sh
+nix flake check --no-update-lock-file -L
+```
+
+- `checks.${system}.package` builds the package on every supported system.
+- `checks.${system}.nixos-module` (Linux only) is a full NixOS VM test
+  (`nix/tests/module.nix`): it boots a VM with `services.teamclaude` enabled and
+  a seeded config, waits for the unit and its port, and asserts
+  `/teamclaude/status` responds with the seeded account — end-to-end coverage of
+  the package, the module wiring, and config seeding. It uses an `apikey`
+  account so startup makes no network calls (VM tests have no network).
+
+The VM test needs KVM on the runner (GitHub-hosted `ubuntu-latest` provides
+`/dev/kvm`).
+
 ## CI
 
 The `CI` workflow runs on pushes and pull requests for `master`, and can also be
 dispatched manually. Alongside the Node test/lint matrix it runs:
 
-- the Nix package build with `nix build --no-update-lock-file .#teamclaude`;
-- a package smoke test with
+- `nix flake check` (package build on the runner's system + the NixOS VM test);
+- a smoke test of the CLI wrapper with
   `nix run --no-update-lock-file .#teamclaude -- help`;
 - a stable aggregate `test` job that branch protection can require.
 
