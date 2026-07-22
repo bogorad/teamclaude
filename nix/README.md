@@ -1,7 +1,7 @@
 # Nix packaging and modules
 
 This directory contains the Nix package, NixOS module, and Home Manager module
-for the TeamClaude fork.
+for TeamClaude.
 
 ## Flake outputs
 
@@ -68,7 +68,7 @@ Import the module and enable `services.teamclaude`:
 
 ```nix
 {
-  inputs.teamclaude.url = "github:bogorad/teamclaude";
+  inputs.teamclaude.url = "github:KarpelesLab/teamclaude";
 
   outputs =
     { nixpkgs, teamclaude, ... }:
@@ -230,42 +230,19 @@ curl --proxy http://<proxy.apiKey>@teamclaude-host:3456 \
   https://www.example.org/
 ```
 
-## CI and auto-update
+## CI
 
-The `CI` workflow runs on pushes and pull requests for `master` and
-`nix-flake-package`, and can also be dispatched manually. It runs:
+The `CI` workflow runs on pushes and pull requests for `master`, and can also be
+dispatched manually. Alongside the Node test/lint matrix it runs:
 
-- the Node test and lint job on Node 24;
 - the Nix package build with `nix build --no-update-lock-file .#teamclaude`;
 - a package smoke test with
   `nix run --no-update-lock-file .#teamclaude -- help`;
 - a stable aggregate `test` job that branch protection can require.
 
-The `Update Upstream` workflow runs on a schedule and can also be dispatched
-manually. It has two jobs:
+## Updating the flake lock
 
-- `watcher` has read-only repository permissions. It fetches
-  `KarpelesLab/teamclaude` `master`, records the exact upstream commit SHA, and
-  decides whether the fork already contains that commit.
-- `updater` runs only when upstream moved or when a manual run sets
-  `force: true`. It checks out `master`, verifies that the watcher commit exists
-  locally, merges that exact commit, refreshes `flake.lock`, builds and
-  smoke-tests the package, commits any lockfile change, pushes `master`, and
-  explicitly starts `CI` for the updated branch.
-
-The exact-SHA handoff avoids a race where the watcher observes one upstream
-commit but the updater later merges a different `upstream/master`. The updater
-either merges the pinned commit or fails.
-
-`force: true` exists for lockfile maintenance and recovery. It lets the updater
-refresh `flake.lock` even when upstream has not moved, which repairs a stale or
-incorrect nixpkgs lock hash without changing TeamClaude source.
-
-The workflow explicitly dispatches `CI` after pushing because GitHub does not
-start ordinary push-triggered workflows recursively from the default
-`GITHUB_TOKEN`.
-
-Because the package uses the repository checkout as `src`, auto-update does not
-manage an upstream source hash. The only Nix hash it refreshes is the nixpkgs
-lock hash in `flake.lock`; the TeamClaude source pin is the Git commit on
-`master`.
+Because the package uses the repository checkout as `src`, there is no upstream
+source hash to manage — the TeamClaude source is pinned by the Git commit
+itself. The only Nix hash in play is the nixpkgs lock in `flake.lock`; refresh it
+with `nix flake update` when you want a newer nixpkgs pin.

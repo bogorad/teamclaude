@@ -13,7 +13,6 @@ let
     mkEnableOption
     mkIf
     mkOption
-    optionalAttrs
     optionalString
     types
     ;

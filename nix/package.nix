@@ -22,7 +22,7 @@ stdenvNoCC.mkDerivation {
     runHook preInstall
 
     mkdir -p $out/bin $out/share/teamclaude
-    cp -R package.json src LICENSE README.md screenshots config.example.json $out/share/teamclaude/
+    cp -R package.json src LICENSE README.md config.example.json $out/share/teamclaude/
     chmod +x $out/share/teamclaude/src/index.js
 
     makeWrapper ${lib.getExe nodejs_24} $out/bin/teamclaude \

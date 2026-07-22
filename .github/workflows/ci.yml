@@ -9,15 +9,20 @@ on:
 
 jobs:
   node:
-    name: node 24
+    name: node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cover the whole supported range — package.json declares "node >=18".
+        node: [18, 20, 22, 24]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Node.js 24
+      - name: Set up Node.js ${{ matrix.node }}
         uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
       - name: Install dependencies
         run: npm install
@@ -26,6 +31,7 @@ jobs:
         run: npm test
 
       - name: Lint
+        if: matrix.node == 24
         run: npm run lint
 
   nix:
