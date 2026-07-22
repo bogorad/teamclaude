@@ -38,7 +38,9 @@ pkgs.testers.runNixOSTest {
       services.teamclaude = {
         enable = true;
         package = self.packages.${system}.teamclaude;
-        configSource = seedConfig;
+        # configSource is typed `str`; interpolate the derivation to its
+        # store-path string (which also pulls it into the VM's closure).
+        configSource = "${seedConfig}";
       };
     };
 
